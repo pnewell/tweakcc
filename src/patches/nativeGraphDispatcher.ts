@@ -26,7 +26,7 @@ import type { PatchResult } from './index';
 
 /** Minimal structural view of a patch implementation. */
 export interface GraphPatchImplementation {
-  fn: (content: string) => string | null;
+  fn: (content: string, name: string) => string | null;
   condition?: boolean;
 }
 
@@ -110,7 +110,7 @@ export const changedModuleSources = (
  * whenever their anchor is absent, which is the expected outcome for all but
  * one of ~2,000 modules; the dispatcher reports the real outcome itself.
  */
-const quietly = <T>(fn: () => T): T => {
+export const quietly = <T>(fn: () => T): T => {
   const saved = [console.log, console.error, console.warn] as const;
   const noop = () => {};
   console.log = noop;
@@ -167,28 +167,35 @@ export const applyPatchImplementationsToGraph = (
         applyOne(sources, implementations, def, patchFilter, owners, options)
       );
     }
-    // Owner modules publish the symbols that patched modules now reach
-    // through the global bridge (see graphContext.ts for why not `import`).
-    for (const [module, code] of bridgePublications()) {
-      const source = sources.get(module);
-      if (source === undefined) continue;
-      // Keep a trailing `export{…};` last: other tooling (and Bun's own
-      // layout) expects the export list to end the module.
-      const trailingExport = source.match(/export\{[^}]*\};?\s*$/);
-      sources.set(
-        module,
-        trailingExport?.index !== undefined
-          ? source.slice(0, trailingExport.index) +
-              code +
-              '\n' +
-              source.slice(trailingExport.index)
-          : source + code
-      );
-    }
+    insertBridgePublications(sources);
   } finally {
     endGraphContext();
   }
   return { results, owners };
+};
+
+/**
+ * Owner modules publish the symbols that patched modules now reach through
+ * the global bridge (see graphContext.ts for why not `import`). Call inside
+ * the graph context, after every module has been finished.
+ */
+export const insertBridgePublications = (sources: Map<string, string>) => {
+  for (const [module, code] of bridgePublications()) {
+    const source = sources.get(module);
+    if (source === undefined) continue;
+    // Keep a trailing `export{…};` last: other tooling (and Bun's own
+    // layout) expects the export list to end the module.
+    const trailingExport = source.match(/export\{[^}]*\};?\s*$/);
+    sources.set(
+      module,
+      trailingExport?.index !== undefined
+        ? source.slice(0, trailingExport.index) +
+            code +
+            '\n' +
+            source.slice(trailingExport.index)
+        : source + code
+    );
+  }
 };
 
 const applyOne = (
@@ -233,7 +240,7 @@ const applyOne = (
       enterGraphModule(name);
       let next: string | null = null;
       try {
-        next = quietly(() => impl.fn(source));
+        next = quietly(() => impl.fn(source, name));
         if (next !== null && next !== source) next = finishGraphModule(next);
       } catch {
         next = null;

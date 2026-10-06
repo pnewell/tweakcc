@@ -54,7 +54,13 @@ export {
 // Content I/O
 // ============================================================================
 
-export { readContent, writeContent } from './content';
+export {
+  readContent,
+  writeContent,
+  readModules,
+  writeModules,
+  patchModules,
+} from './content';
 
 // ============================================================================
 // Backup & Restore
