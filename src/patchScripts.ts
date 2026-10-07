@@ -108,6 +108,7 @@ async function runSandboxedScript(
 ): Promise<string> {
   const wrapper = `
     let input = '';
+    process.stdin.setEncoding('utf8');
     process.stdin.on('data', c => input += c);
     process.stdin.on('end', async () => {
       try {

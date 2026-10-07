@@ -33,7 +33,7 @@ import {
   replaceInSources,
   stringReplacer,
 } from '../commands';
-import { runScriptOnModules } from '../patchScripts';
+import { runScriptOnContent, runScriptOnModules } from '../patchScripts';
 
 const sources = (entries: Record<string, string>) =>
   new Map(Object.entries(entries));
@@ -103,6 +103,13 @@ describe('adhoc-patch replacements across modules', () => {
     expect(() =>
       replaceInSources(modules, stringReplacer('x=', 'z='), 4)
     ).toThrow('Index 4 is out of range. Found 3 occurrence(s).');
+  });
+});
+
+describe('adhoc-patch --script on a single bundle', () => {
+  it('keeps multi-byte characters that span stdin chunks', async () => {
+    const content = `var a="${'\u2026'.repeat(100_000)}";`;
+    expect(await runScriptOnContent('return js;', content)).toBe(content);
   });
 });
 

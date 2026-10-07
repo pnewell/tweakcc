@@ -21,6 +21,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Support code-split native builds (Claude Code 2.1.2xx) and fix patches for Claude Code 2.1.281-2.1.288 (#1023) - @basekevin
 - Support code-split native builds in `adhoc-patch`, `unpack`/`repack`, and the library's `readModules`/`writeModules`/`patchModules` - @pnewell
 - Run patch scripts from `~/.tweakcc/patches` and the `patches` setting during `--apply`, superseding built-in patches with the same id - @pnewell
+- Fix `adhoc-patch --script` corrupting multi-byte characters in single-bundle installs - @pnewell
 
 ## [v4.3.3](https://github.com/Piebald-AI/tweakcc/releases/tag/v4.3.3) - 2026-08-13
 
