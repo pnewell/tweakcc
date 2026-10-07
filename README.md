@@ -219,8 +219,10 @@ List available patch IDs with `tweakcc --list-patches` (or `tweakcc --list-syste
 
 Extract the embedded JavaScript from a native Claude Code binary and write it to a file. This is useful for inspecting Claude Code's source, writing custom patches, or making manual edits before repacking. Note that `unpack` only works with native/binary installations; it will error if pointed at an npm-based installation (`cli.js`), because it can already be read directly from disk. `unpack` takes the path to the JS file to write to, and an optional path to a native binary, which if omitted will default to the current installation.
 
+Code-split native builds (Claude Code 2.1.2xx) embed about 2,000 separate modules instead of a single file. For those, the output path is a new or empty directory, and every JavaScript and text module is written to it as a file, at its path under the Bun root (e.g. `cli`, `chunk-abc123.js`, or `SKILL.md`), along with a `.tweakcc-unpack.json` manifest of each module's hash.
+
 ```bash
-npx tweakcc unpack <output-js-path> [binary-path]
+npx tweakcc unpack <output-path> [binary-path]
 ```
 
 </details>
@@ -230,8 +232,10 @@ npx tweakcc unpack <output-js-path> [binary-path]
 
 Read a JavaScript file and embed it back into a native Claude Code binary. This is the counterpart to `unpack` — after inspecting or modifying the extracted JS, use `repack` to write it back. Like `unpack`, this only works with native installations. `repack` takes a path to a JS file to read from, and an optional path to a native binary, which if omitted, as above, will default to the current installation.
 
+For code-split native builds, pass the directory written by `unpack`. Only the files you edited since the unpack are written back, so changes made to the binary in the meantime (e.g. by `adhoc-patch`) are kept; if the binary's copy of a module you edited has also changed, `repack` refuses and you'll need to unpack again. A missing file leaves its module unchanged, and a file that doesn't match any module is an error. Every edited JavaScript module must parse, or nothing is written.
+
 ```bash
-npx tweakcc repack <input-js-path> [binary-path]
+npx tweakcc repack <input-path> [binary-path]
 ```
 
 Example:
@@ -241,6 +245,11 @@ Example:
 npx tweakcc unpack ./claude-code.js
 # ... make your edits to claude-code.js ...
 npx tweakcc repack ./claude-code.js
+
+# The same for a code-split build, using a directory
+npx tweakcc unpack ./claude-code
+# ... make your edits to e.g. ./claude-code/chunk-abc123.js ...
+npx tweakcc repack ./claude-code
 ```
 
 </details>
@@ -248,7 +257,7 @@ npx tweakcc repack ./claude-code.js
 <details>
 <summary><code>adhoc-patch</code></summary>
 
-Apply a one-off or ad-hoc patch to a Claude Code installation without going through the tweakcc UI or config system. It supports three modes and works with both native and npm-based installations.
+Apply a one-off or ad-hoc patch to a Claude Code installation without going through the tweakcc UI or config system. It supports three modes and works with both native and npm-based installations. On code-split native builds (Claude Code 2.1.2xx), every mode runs across all of the embedded modules, and only the modules that change are written back.
 
 3 modes of patching are supported.
 
@@ -256,7 +265,7 @@ Apply a one-off or ad-hoc patch to a Claude Code installation without going thro
 
 A fixed/static old string is replaced with a fixed/static new string, analogous to `grep -F`.
 
-- By default, all instances of the old string are replaced, but you can use `--index` to specify a particular occurrence by 1-based index, e.g. `--index 1` to replace only the first, `--index 2` to replace only the second, etc.
+- By default, all instances of the old string are replaced, but you can use `--index` to specify a particular occurrence by 1-based index, e.g. `--index 1` to replace only the first, `--index 2` to replace only the second, etc. On code-split builds, occurrences are counted across all modules in order.
 
 #### `--regex`
 
@@ -293,6 +302,10 @@ This is the most powerful option. A short snippet of JavaScript code running in 
     boxComponent: 'NZ5',
   };
   ```
+
+- **Code-split builds:** The script runs once per JavaScript module, with `js` set to that module's source and a third variable, `name`, set to the module's name (e.g. `/$bunfs/root/chunk-abc123.js`). Return `js` unchanged for modules you don't want to touch. If the script throws or doesn't return a string for a module, that module is left unchanged, and tweakcc reports how many modules were skipped along with the first error. If the script fails on any module and changes none, the patch fails with that error.
+
+  Each module gets its own `vars`. A name defined in another module is an expression like `globalThis.__tweakccExports.chunk_abc123_js__me`, which the defining module publishes when your patch uses it. It only works once the defining module has loaded, so use it inside functions and callbacks rather than in code that runs when your module first loads.
 
 - **Script source:** Scripts can be passed in 3 ways: directly on the command-line, via a local file on disk, and via an HTTP URL. In order to specify a file, pass the path to the file prefixed with `@` (similar to `curl -d`). To specify an HTTP URL, use `@` and ensure the URL is prefixed with `http://` or `https://`. HTTP scripts themselves are safe to run as a result of our sandboxing, with one notable pitfall, as mentioned above.
 
@@ -474,6 +487,7 @@ Use ↑↓ arrows to navigate, Enter to select, Esc to quit
  *
  * - npm installs: reads cli.js directly
  * - native installs: extracts embedded JS from binary
+ * - code-split native installs: throws; use readModules() instead
  */
 async function readContent(installation: Installation): Promise<string>;
 
@@ -482,11 +496,43 @@ async function readContent(installation: Installation): Promise<string>;
  *
  * - npm installs: writes to cli.js (handles permissions, hard links)
  * - native installs: repacks JS into binary
+ * - code-split native installs: throws; use writeModules() instead
  */
 async function writeContent(
   installation: Installation,
   content: string
 ): Promise<void>;
+
+/**
+ * Read every JavaScript and text (`.md`) module of a code-split native build
+ * (Claude Code 2.1.2xx), keyed by module name.  Returns null for npm installs
+ * and native builds that embed a single bundle.
+ */
+async function readModules(
+  installation: Installation
+): Promise<Map<string, string> | null>;
+
+/**
+ * Write modules back into a code-split native build.  Every module in the map
+ * that differs from the binary is written, so pass only the modules you
+ * changed or a map from a fresh readModules().  Changed JavaScript modules
+ * must parse first.  Returns the names of the modules that changed.
+ */
+async function writeModules(
+  installation: Installation,
+  modules: ReadonlyMap<string, string>
+): Promise<string[]>;
+
+/**
+ * Run `transform` over every JavaScript module of a code-split native build
+ * and write the modules it changes.  Helpers called inside `transform` return
+ * names that are valid in that module, including names from other modules.
+ * Return null to skip a module.  Returns the names of the modules that changed.
+ */
+async function patchModules(
+  installation: Installation,
+  transform: (js: string, name: string) => string | null
+): Promise<string[]>;
 ```
 
 Demo:

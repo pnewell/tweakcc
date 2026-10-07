@@ -92,6 +92,11 @@ import {
   textModuleSources,
 } from './nativeGraphDispatcher';
 import { assertPatchedModuleParses } from './moduleParseGate';
+import {
+  applyCustomPatches,
+  applyCustomPatchesToGraph,
+  listCustomPatches,
+} from './customPatches';
 import { writeClearScreen } from './clearScreen';
 import { writeSessionColor } from './sessionColor';
 import { writeKeybindingCustomization } from './keybindingCustomization';
@@ -142,6 +147,7 @@ export enum PatchGroup {
   ALWAYS_APPLIED = 'Always Applied',
   MISC_CONFIGURABLE = 'Misc Configurable',
   FEATURES = 'Features',
+  CUSTOM = 'Custom',
 }
 
 export interface PatchResult {
@@ -548,12 +554,13 @@ export const escapeIdent = (ident: string): string => {
 const applyPatchImplementations = (
   content: string,
   implementations: Record<PatchId, PatchImplementation>,
+  definitions: readonly PatchDefinition[],
   patchFilter?: string[] | null
 ): { content: string; results: PatchResult[] } => {
   const results: PatchResult[] = [];
 
-  // Process patches in the order defined in PATCH_DEFINITIONS
-  for (const def of PATCH_DEFINITIONS) {
+  // Process patches in the order given
+  for (const def of definitions) {
     const impl = implementations[def.id];
 
     // Skip patches not in the filter (if filter is provided)
@@ -1119,11 +1126,17 @@ export const applyCustomization = async (
     legacyItems
   );
 
+  // A patch script named after a built-in patch replaces it.
+  const customPatches = await listCustomPatches(config.settings.patches);
+  const builtInPatches = PATCH_DEFINITIONS.filter(
+    def => !customPatches.has(def.id)
+  );
+
   if (nativeGraph && graphSources) {
     const { results: graphResults } = applyPatchImplementationsToGraph(
       graphSources,
       patchImplementations,
-      PATCH_DEFINITIONS.filter(def => def.id !== 'prevent-unsupported-updates'),
+      builtInPatches.filter(def => def.id !== 'prevent-unsupported-updates'),
       patchFilter,
       {
         entryModule: nativeGraph.modules[nativeGraph.entryPointIndex]?.name,
@@ -1134,12 +1147,22 @@ export const applyCustomization = async (
 
     // The update guard spans the updater's caller and installer modules, so it
     // is applied to the whole graph at once rather than module by module.
-    const guardResult = applyUpdateGuardToGraph(
-      config,
-      graphSources,
-      patchFilter
+    if (!customPatches.has('prevent-unsupported-updates')) {
+      const guardResult = applyUpdateGuardToGraph(
+        config,
+        graphSources,
+        patchFilter
+      );
+      if (guardResult) allResults.push(guardResult);
+    }
+
+    allResults.push(
+      ...(await applyCustomPatchesToGraph(
+        graphSources,
+        customPatches,
+        patchFilter
+      ))
     );
-    if (guardResult) allResults.push(guardResult);
 
     const replacements = changedModuleSources(nativeGraph, graphSources);
     for (const [name, contents] of replacements)
@@ -1167,21 +1190,31 @@ export const applyCustomization = async (
   // Apply all patches
   // ==========================================================================
   const { content: patchedContent, results: patchResults } =
-    applyPatchImplementations(content, patchImplementations, patchFilter);
-  // Unmodified native bytes are not repacked; the restored backup stays as is.
-  const nativeChanged = patchedContent !== content;
-  content = patchedContent;
+    applyPatchImplementations(
+      content,
+      patchImplementations,
+      builtInPatches,
+      patchFilter
+    );
   allResults.push(...patchResults);
+  const sourceType = ccInstInfo.nativeInstallationPath ? 'auto' : 'module';
+  const custom = await applyCustomPatches(
+    patchedContent,
+    customPatches,
+    patchFilter,
+    sourceType
+  );
+  allResults.push(...custom.results);
+  // Unmodified native bytes are not repacked; the restored backup stays as is.
+  const nativeChanged = custom.content !== content;
+  content = custom.content;
 
   // ==========================================================================
   // Verify the patched bundle parses before writing it
   // ==========================================================================
   try {
     if (!ccInstInfo.nativeInstallationPath || nativeChanged) {
-      assertPatchedBundleParses(
-        content,
-        ccInstInfo.nativeInstallationPath ? 'auto' : 'module'
-      );
+      assertPatchedBundleParses(content, sourceType);
     }
   } catch (err) {
     if (!(err instanceof PatchedBundleParseError)) {

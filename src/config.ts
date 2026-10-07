@@ -84,6 +84,7 @@ export const NATIVE_BINARY_BACKUP_FILE = path.join(
 );
 export const SYSTEM_PROMPTS_DIR = path.join(CONFIG_DIR, 'system-prompts');
 export const PROMPT_CACHE_DIR = path.join(CONFIG_DIR, 'prompt-data-cache');
+export const PATCHES_DIR = path.join(CONFIG_DIR, 'patches');
 
 /**
  * Checks for multiple config locations and warns user

@@ -4,26 +4,31 @@
  * Implements: unpack, repack, adhoc-patch subcommands.
  */
 
+import { createHash } from 'node:crypto';
 import * as fs from 'node:fs/promises';
+import * as path from 'node:path';
 import * as readline from 'node:readline';
-import { spawn, execSync } from 'node:child_process';
 
 import chalk from 'chalk';
 
 import { formatAndDiff } from './formatAndDiff';
 
 import { tryDetectInstallation } from './lib/detection';
-import { readContent, writeContent } from './lib/content';
-import { Installation } from './lib/types';
 import {
-  findChalkVar,
-  getModuleLoaderFunction,
-  getReactVar,
-  getRequireFuncName,
-  findTextComponent,
-  findBoxComponent,
-  clearCaches,
-} from './patches/helpers';
+  readContent,
+  readModules,
+  readNativeGraph,
+  writeContent,
+  writeModules,
+} from './lib/content';
+import { Installation } from './lib/types';
+import { PatchedModuleParseError } from './patches/moduleParseGate';
+import { javaScriptModuleSources } from './patches/nativeGraphDispatcher';
+import {
+  resolveScriptSource,
+  runScriptOnContent,
+  runScriptOnModules,
+} from './patchScripts';
 
 // =============================================================================
 // Diff Approval
@@ -75,13 +80,14 @@ function renderDiffToConsole(
   }
 }
 
-export async function promptUserForDiffApproval(
+/**
+ * Prints the formatted diff of one change. Returns its number of visible
+ * changes, or null if no diff could be generated.
+ */
+async function printFormattedDiff(
   originalJs: string,
-  modifiedJs: string,
-  skipConfirmation = false
-): Promise<boolean> {
-  if (skipConfirmation) return true;
-
+  modifiedJs: string
+): Promise<number | null> {
   console.log(chalk.gray('Formatting for diff preview...'));
 
   const result = await formatAndDiff(originalJs, modifiedJs, {
@@ -94,15 +100,10 @@ export async function promptUserForDiffApproval(
         'Could not generate formatted diff (oxfmt unavailable or parse error).'
       )
     );
-    return askYesNo(chalk.bold('\nApply changes without diff preview? [Y/n] '));
+    return null;
   }
 
-  if (result.changeCount === 0) {
-    console.log(
-      chalk.yellow('No visible differences after formatting. Proceeding.')
-    );
-    return true;
-  }
+  if (result.changeCount === 0) return 0;
 
   console.log(
     chalk.gray(
@@ -118,234 +119,55 @@ export async function promptUserForDiffApproval(
     )
   );
 
+  return result.changeCount;
+}
+
+/**
+ * Asks once for approval of the diffs printed by printFormattedDiff().
+ */
+function askDiffApproval(changeCounts: (number | null)[]): Promise<boolean> {
+  if (changeCounts.every(count => count === null)) {
+    return askYesNo(chalk.bold('\nApply changes without diff preview? [Y/n] '));
+  }
+
+  if (changeCounts.every(count => count === 0)) {
+    console.log(
+      chalk.yellow('No visible differences after formatting. Proceeding.')
+    );
+    return Promise.resolve(true);
+  }
+
   return askYesNo(chalk.bold('\nApply these changes? [Y/n] '));
 }
 
-// =============================================================================
-// Pre-resolved Variables for Scripts
-// =============================================================================
+export async function promptUserForDiffApproval(
+  originalJs: string,
+  modifiedJs: string,
+  skipConfirmation = false
+): Promise<boolean> {
+  if (skipConfirmation) return true;
 
-/**
- * Pre-resolved minified variable names from Claude Code's JS content.
- * These are passed into adhoc-patch scripts as `vars` so script authors
- * don't need to run detection functions themselves (which they can't,
- * since scripts run in a sandbox with no access to tweakcc modules).
- */
-interface ResolvedVars {
-  /** The chalk instance variable name, e.g. "Ke" */
-  chalkVar: string | undefined;
-  /** The module loader function name, e.g. "T" */
-  moduleLoaderFunction: string | undefined;
-  /** The React variable name, e.g. "fH" */
-  reactVar: string | undefined;
-  /** The require function name — "require" for Bun, or a variable name for esbuild */
-  requireFuncName: string;
-  /** The Ink Text component function name */
-  textComponent: string | undefined;
-  /** The Ink Box component function name */
-  boxComponent: string | undefined;
+  return askDiffApproval([await printFormattedDiff(originalJs, modifiedJs)]);
 }
 
 /**
- * Resolve all helper variables from the content.
- * Clears caches first to ensure fresh results.
+ * Shows a diff for each changed module under its name, then asks once.
  */
-function resolveVars(content: string): ResolvedVars {
-  clearCaches();
-  return {
-    chalkVar: findChalkVar(content),
-    moduleLoaderFunction: getModuleLoaderFunction(content),
-    reactVar: getReactVar(content),
-    requireFuncName: getRequireFuncName(content),
-    textComponent: findTextComponent(content),
-    boxComponent: findBoxComponent(content),
-  };
-}
+async function promptUserForModuleDiffApproval(
+  original: ReadonlyMap<string, string>,
+  modified: ReadonlyMap<string, string>,
+  skipConfirmation = false
+): Promise<boolean> {
+  if (skipConfirmation) return true;
 
-// =============================================================================
-// Sandboxed Script Execution
-// =============================================================================
-
-/**
- * Executes a patch script in a sandboxed Node.js process.
- *
- * The script is run as `new Function('code', 'vars', script)` where:
- * - `code` is the JavaScript content of the Claude Code installation
- * - `vars` is an object containing pre-resolved minified variable names
- *   (chalkVar, reactVar, requireFuncName, textComponent, boxComponent, etc.)
- *
- * The script must return the modified JavaScript content.
- *
- * The sandbox uses Node's permission model with no grants, meaning the script
- * cannot read/write files, make network calls, or spawn child processes.
- *
- * Compatibility: tries `--permission` first (Node 24+), falls back to
- * `--experimental-permission` (Node 20–23). If neither is recognised the
- * user is told to upgrade to Node 20+ or rerun with
- * `--dangerous-no-script-sandbox`.
- *
- * When `noSandbox` is true the script runs without any permission flag at all
- * (useful for Node < 20 where neither flag exists).
- *
- * @param script - The script body to execute
- * @param inputCode - The JavaScript content to pass as the `code` parameter
- * @param vars - Pre-resolved minified variable names
- * @param noSandbox - If true, skip the permission sandbox entirely
- * @returns The modified JavaScript content returned by the script
- */
-async function runSandboxedScript(
-  script: string,
-  inputCode: string,
-  vars: ResolvedVars,
-  noSandbox = false
-): Promise<string> {
-  const wrapper = `
-    let input = '';
-    process.stdin.on('data', c => input += c);
-    process.stdin.on('end', async () => {
-      try {
-        const vars = ${JSON.stringify(vars)};
-        process.env = {};
-        const fn = new Function('js', 'vars', ${JSON.stringify(script)});
-        const result = await fn(input, vars);
-        process.stdout.write(JSON.stringify({"r": result}));
-      } catch (e) {
-        process.stderr.write(e instanceof Error ? e.message : String(e));
-        process.exitCode = 1;
-      }
-    });
-  `;
-
-  if (noSandbox) {
-    return spawnNodeWithWrapper([], wrapper, inputCode);
+  const changeCounts: (number | null)[] = [];
+  for (const [name, source] of modified) {
+    if (source === original.get(name)) continue;
+    console.log(chalk.bold(`\n${name}`));
+    changeCounts.push(await printFormattedDiff(original.get(name)!, source));
   }
 
-  // Try --permission first (Node 24+)
-  try {
-    return await spawnNodeWithWrapper(['--permission'], wrapper, inputCode);
-  } catch (error) {
-    if (isBadOptionError(error)) {
-      // Fall through to try the older flag
-    } else {
-      throw error;
-    }
-  }
-
-  // Try --experimental-permission (Node 20–23)
-  try {
-    return await spawnNodeWithWrapper(
-      ['--experimental-permission'],
-      wrapper,
-      inputCode
-    );
-  } catch (error) {
-    if (isBadOptionError(error)) {
-      // Neither flag works — the Node version is too old
-      const nodeVersion = getNodeVersion();
-      throw new Error(
-        `Your Node.js version (${nodeVersion}) does not support the permission model.\n` +
-          'Please either upgrade to Node.js 20+ or rerun with --dangerous-no-script-sandbox.'
-      );
-    }
-    throw error;
-  }
-}
-
-/**
- * Returns true when an error from a spawned node process indicates that a CLI
- * flag was not recognised ("bad option").
- */
-function isBadOptionError(error: unknown): boolean {
-  if (!(error instanceof Error)) return false;
-  return error.message.includes('bad option');
-}
-
-/**
- * Gets the current Node.js version string (e.g. "v18.17.0").
- */
-function getNodeVersion(): string {
-  try {
-    return execSync('node --version', { encoding: 'utf8' }).trim();
-  } catch {
-    return 'unknown';
-  }
-}
-
-/**
- * Spawns a node process with the given extra CLI flags, feeds `inputCode` on
- * stdin, and resolves with the JSON-wrapped result from stdout.
- */
-function spawnNodeWithWrapper(
-  extraArgs: string[],
-  wrapper: string,
-  inputCode: string
-): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const child = spawn('node', [...extraArgs, '-e', wrapper], {
-      stdio: ['pipe', 'pipe', 'pipe'],
-    });
-
-    let stdout = '',
-      stderr = '';
-    child.stdout.on('data', (d: Buffer) => (stdout += d));
-    child.stderr.on('data', (d: Buffer) => (stderr += d));
-
-    child.on('error', reject);
-    child.stdin.on('error', () => {});
-
-    child.on('close', code => {
-      if (code !== 0)
-        reject(new Error(stderr || `Script exited with code ${code}`));
-      else {
-        try {
-          resolve(JSON.parse(stdout).r);
-        } catch {
-          reject(
-            new Error(
-              `Script returned invalid JSON output.\nstdout: ${stdout}\nstderr: ${stderr}`
-            )
-          );
-        }
-      }
-    });
-
-    child.stdin.write(inputCode);
-    child.stdin.end();
-  });
-}
-
-// =============================================================================
-// Helper: Resolve Script Source
-// =============================================================================
-
-/**
- * Resolves the script source from a --script argument.
- *
- * - If it starts with `@`, the rest is treated as a file path or URL.
- *   - If it starts with `http://` or `https://`, it's fetched as a URL.
- *   - Otherwise, it's read as a local file.
- * - Otherwise, the argument itself is the script body.
- */
-async function resolveScriptSource(scriptArg: string): Promise<string> {
-  if (!scriptArg.startsWith('@')) {
-    return scriptArg;
-  }
-
-  const ref = scriptArg.slice(1);
-
-  if (ref.startsWith('http://') || ref.startsWith('https://')) {
-    console.log(`Fetching script from ${ref}...`);
-    const response = await fetch(ref);
-    if (!response.ok) {
-      throw new Error(
-        `Failed to fetch script from ${ref}: HTTP ${response.status} ${response.statusText}`
-      );
-    }
-    return response.text();
-  }
-
-  console.log(`Reading script from ${ref}...`);
-  return fs.readFile(ref, 'utf8');
+  return askDiffApproval(changeCounts);
 }
 
 // =============================================================================
@@ -370,17 +192,57 @@ async function resolveInstallation(pathArg?: string): Promise<Installation> {
 }
 
 // =============================================================================
+// Helper: Write Modules
+// =============================================================================
+
+/**
+ * Writes changed modules of a code-split build. If a changed module no longer
+ * parses, nothing is written and the parse error is shown.
+ */
+async function writeModulesOrExit(
+  installation: Installation,
+  modules: ReadonlyMap<string, string>
+): Promise<string[]> {
+  try {
+    return await writeModules(installation, modules);
+  } catch (error) {
+    if (!(error instanceof PatchedModuleParseError)) throw error;
+    console.error(chalk.red(`Error: ${error.message}`));
+    process.exit(1);
+  }
+}
+
+// =============================================================================
 // Subcommand: unpack
 // =============================================================================
 
 /**
- * Extract JS from a native Claude Code binary and write it to a file.
+ * Written by unpack next to the module files: each module's SHA-256 as
+ * unpacked, so repack can tell which files were edited.
+ */
+const UNPACK_MANIFEST = '.tweakcc-unpack.json';
+
+function hashSource(source: string): string {
+  return createHash('sha256').update(source).digest('hex');
+}
+
+/**
+ * A module's file path relative to the Bun root (`/$bunfs/root/` on POSIX,
+ * `B:/~BUN/root/` on Windows), e.g. `chunk-abc123.js`.
+ */
+export function moduleFilePath(name: string): string {
+  return name.replace(/^(?:\/\$bunfs|B:\/~BUN)\/root\//, '');
+}
+
+/**
+ * Extract JS from a native Claude Code binary and write it to a file, or,
+ * for a code-split build, every module to a directory.
  *
- * @param outputJsPath - Path to write the extracted JS
+ * @param outputPath - Path to write the extracted JS
  * @param binaryPath - Optional path to the native binary (auto-detect if omitted)
  */
 export async function handleUnpack(
-  outputJsPath: string,
+  outputPath: string,
   binaryPath?: string
 ): Promise<void> {
   const installation = await resolveInstallation(binaryPath);
@@ -403,12 +265,44 @@ export async function handleUnpack(
     `Extracting JS from native binary: ${chalk.cyan(installation.path)} (v${installation.version})`
   );
 
+  const modules = await readModules(installation);
+  if (modules) {
+    const existing = await fs.readdir(outputPath).catch(() => []);
+    if (existing.length > 0) {
+      console.error(
+        chalk.red(
+          `Error: ${outputPath} is not empty. Unpack a code-split build into a new or empty directory.`
+        )
+      );
+      process.exit(1);
+    }
+
+    const manifest: Record<string, string> = {};
+    for (const [name, source] of modules) {
+      const file = path.join(outputPath, moduleFilePath(name));
+      await fs.mkdir(path.dirname(file), { recursive: true });
+      await fs.writeFile(file, source, 'utf8');
+      manifest[name] = hashSource(source);
+    }
+    await fs.writeFile(
+      path.join(outputPath, UNPACK_MANIFEST),
+      JSON.stringify(manifest, null, 2)
+    );
+
+    console.log(
+      chalk.green(
+        `✓ Extracted ${modules.size} module(s) to ${chalk.cyan(outputPath)}`
+      )
+    );
+    return;
+  }
+
   const content = await readContent(installation);
 
-  await fs.writeFile(outputJsPath, content, 'utf8');
+  await fs.writeFile(outputPath, content, 'utf8');
 
   console.log(
-    chalk.green(`✓ Extracted JS written to ${chalk.cyan(outputJsPath)}`)
+    chalk.green(`✓ Extracted JS written to ${chalk.cyan(outputPath)}`)
   );
   console.log(
     chalk.gray(`  ${content.length.toLocaleString()} characters written`)
@@ -420,13 +314,15 @@ export async function handleUnpack(
 // =============================================================================
 
 /**
- * Read JS from a file and embed it back into a native Claude Code binary.
+ * Read JS from a file and embed it back into a native Claude Code binary, or,
+ * for a code-split build, the module files edited since unpack wrote them to
+ * a directory. A module whose file is missing is left unchanged.
  *
- * @param inputJsPath - Path to the JS file to embed
+ * @param inputPath - Path to the JS file or directory to embed
  * @param binaryPath - Optional path to the native binary (auto-detect if omitted)
  */
 export async function handleRepack(
-  inputJsPath: string,
+  inputPath: string,
   binaryPath?: string
 ): Promise<void> {
   const installation = await resolveInstallation(binaryPath);
@@ -449,13 +345,110 @@ export async function handleRepack(
     `Repacking JS into native binary: ${chalk.cyan(installation.path)} (v${installation.version})`
   );
 
-  const newJs = await fs.readFile(inputJsPath, 'utf8');
+  const modules = await readModules(installation);
+  const isDirectory = (await fs.stat(inputPath)).isDirectory();
+  if (modules && !isDirectory) {
+    console.error(
+      chalk.red(
+        'Error: This is a code-split build. Pass the directory written by `tweakcc unpack`, not a single file.'
+      )
+    );
+    process.exit(1);
+  }
+  if (!modules && isDirectory) {
+    console.error(
+      chalk.red(
+        'Error: This build embeds a single JS file. Pass the file written by `tweakcc unpack`, not a directory.'
+      )
+    );
+    process.exit(1);
+  }
+
+  if (modules) {
+    let manifest: Record<string, string>;
+    try {
+      manifest = JSON.parse(
+        await fs.readFile(path.join(inputPath, UNPACK_MANIFEST), 'utf8')
+      );
+    } catch {
+      console.error(
+        chalk.red(
+          `Error: ${inputPath} has no ${UNPACK_MANIFEST}. Pass a directory written by \`tweakcc unpack\`.`
+        )
+      );
+      process.exit(1);
+    }
+
+    const names = new Map(
+      Object.keys(manifest).map(name => [
+        path.join(inputPath, moduleFilePath(name)),
+        name,
+      ])
+    );
+    const edited = new Map<string, string>();
+    const unknown: string[] = [];
+    for (const relative of await fs.readdir(inputPath, { recursive: true })) {
+      const file = path.join(inputPath, relative);
+      const name = names.get(file);
+      if (name !== undefined) {
+        const source = await fs.readFile(file, 'utf8');
+        if (hashSource(source) !== manifest[name]) edited.set(name, source);
+      } else if (
+        relative !== UNPACK_MANIFEST &&
+        !(await fs.stat(file)).isDirectory()
+      ) {
+        unknown.push(relative);
+      }
+    }
+
+    if (unknown.length > 0) {
+      console.error(
+        chalk.red(
+          `Error: ${unknown.length} file(s) in ${inputPath} do not match any module:`
+        )
+      );
+      for (const relative of unknown) {
+        console.error(chalk.gray(`  ${relative}`));
+      }
+      process.exit(1);
+    }
+
+    // Writing an edit over a module that changed since the unpack would undo
+    // that change.
+    const stale = [...edited.keys()].filter(name => {
+      const current = modules.get(name);
+      return current === undefined || hashSource(current) !== manifest[name];
+    });
+    if (stale.length > 0) {
+      console.error(
+        chalk.red(
+          `Error: ${stale.length} edited module(s) changed in ${installation.path} since they were unpacked:`
+        )
+      );
+      for (const name of stale) {
+        console.error(chalk.gray(`  ${moduleFilePath(name)}`));
+      }
+      console.error(chalk.gray('Unpack again and redo these edits.'));
+      process.exit(1);
+    }
+
+    const changed = await writeModulesOrExit(installation, edited);
+
+    console.log(
+      chalk.green(
+        `✓ ${changed.length} changed module(s) from ${chalk.cyan(inputPath)} repacked into ${chalk.cyan(installation.path)}`
+      )
+    );
+    return;
+  }
+
+  const newJs = await fs.readFile(inputPath, 'utf8');
 
   await writeContent(installation, newJs);
 
   console.log(
     chalk.green(
-      `✓ JS from ${chalk.cyan(inputJsPath)} repacked into ${chalk.cyan(installation.path)}`
+      `✓ JS from ${chalk.cyan(inputPath)} repacked into ${chalk.cyan(installation.path)}`
     )
   );
 }
@@ -463,6 +456,185 @@ export async function handleRepack(
 // =============================================================================
 // Subcommand: adhoc-patch
 // =============================================================================
+
+/**
+ * Finds and replaces occurrences in a single string, for --string and --regex.
+ */
+export interface Replacer {
+  /** Error shown when nothing matches. */
+  notFound: string;
+  /** What an occurrence is called in messages, e.g. "match(es)". */
+  unit: string;
+  count: (content: string) => number;
+  replaceAll: (content: string) => string;
+  /** Replaces only the nth (0-based) occurrence. */
+  replaceNth: (content: string, n: number) => string;
+}
+
+export function stringReplacer(oldString: string, newString: string): Replacer {
+  return {
+    notFound: 'String not found in content.',
+    unit: 'occurrence(s)',
+    // Use split/join for literal string replacement (no regex escaping needed)
+    count: content => content.split(oldString).length - 1,
+    replaceAll: content => content.split(oldString).join(newString),
+    replaceNth: (content, n) => {
+      const occurrences: number[] = [];
+      let pos = 0;
+      while (true) {
+        const found = content.indexOf(oldString, pos);
+        if (found === -1) break;
+        occurrences.push(found);
+        pos = found + oldString.length;
+      }
+
+      const replaceAt = occurrences[n];
+      return (
+        content.slice(0, replaceAt) +
+        newString +
+        content.slice(replaceAt + oldString.length)
+      );
+    },
+  };
+}
+
+export function regexReplacer(
+  pattern: string,
+  flags: string,
+  replacement: string
+): Replacer {
+  // Ensure 'g' flag is present for matchAll / replaceAll
+  const globalFlags = flags.includes('g') ? flags : flags + 'g';
+
+  return {
+    notFound: 'Regex pattern not found in content.',
+    unit: 'match(es)',
+    count: content =>
+      [...content.matchAll(new RegExp(pattern, globalFlags))].length,
+    replaceAll: content =>
+      content.replace(new RegExp(pattern, globalFlags), replacement),
+    replaceNth: (content, n) => {
+      const match = [...content.matchAll(new RegExp(pattern, globalFlags))][n];
+      const matchStart = match.index!;
+      const matchEnd = matchStart + match[0].length;
+
+      // Build the replacement string with group substitutions
+      const resolvedReplacement = match[0].replace(
+        new RegExp(pattern, flags),
+        replacement
+      );
+
+      return (
+        content.slice(0, matchStart) +
+        resolvedReplacement +
+        content.slice(matchEnd)
+      );
+    },
+  };
+}
+
+/**
+ * Applies a replacer to each source in order. With `index` (1-based), only
+ * that occurrence is replaced, counting across all sources in order. Throws
+ * if nothing matches or `index` is out of range.
+ */
+export function replaceInSources(
+  sources: ReadonlyMap<string, string>,
+  replacer: Replacer,
+  index: number | undefined
+): { modified: Map<string, string>; count: number } {
+  const counts = [...sources.values()].map(replacer.count);
+  const total = counts.reduce((sum, count) => sum + count, 0);
+
+  if (total === 0) {
+    throw new Error(replacer.notFound);
+  }
+
+  if (index !== undefined && (index < 1 || index > total)) {
+    throw new Error(
+      `Index ${index} is out of range. Found ${total} ${replacer.unit}.`
+    );
+  }
+
+  const modified = new Map(sources);
+  let skip = index === undefined ? 0 : index - 1;
+  for (const [i, [name, content]] of [...sources].entries()) {
+    if (index === undefined) {
+      if (counts[i] > 0) modified.set(name, replacer.replaceAll(content));
+    } else if (skip < counts[i]) {
+      modified.set(name, replacer.replaceNth(content, skip));
+      break;
+    } else {
+      skip -= counts[i];
+    }
+  }
+
+  return { modified, count: index === undefined ? total : 1 };
+}
+
+/**
+ * Apply a string or regex replacement patch, across every module of a
+ * code-split native build.
+ */
+async function handleAdhocPatchReplace(
+  replacer: Replacer,
+  index: number | undefined,
+  installation: Installation,
+  skipConfirmation = false
+): Promise<void> {
+  const modules = await readModules(installation);
+  const sources =
+    modules ?? new Map([[installation.path, await readContent(installation)]]);
+
+  let result: ReturnType<typeof replaceInSources>;
+  try {
+    result = replaceInSources(sources, replacer, index);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.error(chalk.red(`Error: ${message}`));
+    process.exit(1);
+  }
+  const { modified, count } = result;
+
+  if (modules) {
+    const approved = await promptUserForModuleDiffApproval(
+      sources,
+      modified,
+      skipConfirmation
+    );
+    if (!approved) {
+      console.log(chalk.yellow('Aborted.'));
+      return;
+    }
+
+    const changed = await writeModulesOrExit(installation, modified);
+
+    console.log(
+      chalk.green(
+        `✓ Replaced ${count} ${replacer.unit} in ${changed.length} module(s) of ${chalk.cyan(installation.path)}`
+      )
+    );
+    return;
+  }
+
+  const approved = await promptUserForDiffApproval(
+    sources.get(installation.path)!,
+    modified.get(installation.path)!,
+    skipConfirmation
+  );
+  if (!approved) {
+    console.log(chalk.yellow('Aborted.'));
+    return;
+  }
+
+  await writeContent(installation, modified.get(installation.path)!);
+
+  console.log(
+    chalk.green(
+      `✓ Replaced ${count} ${replacer.unit} in ${chalk.cyan(installation.path)}`
+    )
+  );
+}
 
 /**
  * Apply a string replacement patch.
@@ -474,72 +646,11 @@ async function handleAdhocPatchString(
   installation: Installation,
   skipConfirmation = false
 ): Promise<void> {
-  const content = await readContent(installation);
-
-  let modified: string;
-  let count: number;
-
-  if (index !== undefined) {
-    // Replace only the Nth occurrence (1-based)
-    const occurrences: number[] = [];
-    let pos = 0;
-    while (true) {
-      const found = content.indexOf(oldString, pos);
-      if (found === -1) break;
-      occurrences.push(found);
-      pos = found + oldString.length;
-    }
-
-    if (occurrences.length === 0) {
-      console.error(chalk.red('Error: String not found in content.'));
-      process.exit(1);
-    }
-
-    if (index < 1 || index > occurrences.length) {
-      console.error(
-        chalk.red(
-          `Error: Index ${index} is out of range. Found ${occurrences.length} occurrence(s).`
-        )
-      );
-      process.exit(1);
-    }
-
-    const replaceAt = occurrences[index - 1];
-    modified =
-      content.slice(0, replaceAt) +
-      newString +
-      content.slice(replaceAt + oldString.length);
-    count = 1;
-  } else {
-    // Replace all occurrences
-    // Use split/join for literal string replacement (no regex escaping needed)
-    const parts = content.split(oldString);
-    count = parts.length - 1;
-
-    if (count === 0) {
-      console.error(chalk.red('Error: String not found in content.'));
-      process.exit(1);
-    }
-
-    modified = parts.join(newString);
-  }
-
-  const approved = await promptUserForDiffApproval(
-    content,
-    modified,
+  await handleAdhocPatchReplace(
+    stringReplacer(oldString, newString),
+    index,
+    installation,
     skipConfirmation
-  );
-  if (!approved) {
-    console.log(chalk.yellow('Aborted.'));
-    return;
-  }
-
-  await writeContent(installation, modified);
-
-  console.log(
-    chalk.green(
-      `✓ Replaced ${count} occurrence(s) in ${chalk.cyan(installation.path)}`
-    )
   );
 }
 
@@ -600,8 +711,6 @@ async function handleAdhocPatchRegex(
   installation: Installation,
   skipConfirmation = false
 ): Promise<void> {
-  const content = await readContent(installation);
-
   let parsed: { pattern: string; flags: string };
   try {
     parsed = parseRegexLiteral(rawPattern);
@@ -611,62 +720,72 @@ async function handleAdhocPatchRegex(
     process.exit(1);
   }
 
-  // Ensure 'g' flag is present for matchAll / replaceAll
-  const flags = parsed.flags.includes('g') ? parsed.flags : parsed.flags + 'g';
+  await handleAdhocPatchReplace(
+    regexReplacer(parsed.pattern, parsed.flags, replacement),
+    index,
+    installation,
+    skipConfirmation
+  );
+}
 
-  let modified: string;
-  let count: number;
-
-  const regex = new RegExp(parsed.pattern, flags);
-
-  if (index !== undefined) {
-    // Replace only the Nth match (1-based)
-    const matches = [...content.matchAll(regex)];
-
-    if (matches.length === 0) {
-      console.error(chalk.red('Error: Regex pattern not found in content.'));
-      process.exit(1);
-    }
-
-    if (index < 1 || index > matches.length) {
-      console.error(
-        chalk.red(
-          `Error: Index ${index} is out of range. Found ${matches.length} match(es).`
-        )
-      );
-      process.exit(1);
-    }
-
-    const match = matches[index - 1];
-    const matchStart = match.index!;
-    const matchEnd = matchStart + match[0].length;
-
-    // Build the replacement string with group substitutions
-    const resolvedReplacement = match[0].replace(
-      new RegExp(parsed.pattern, parsed.flags),
-      replacement
+/**
+ * Apply a script-based patch to every JavaScript module of a code-split
+ * native build.
+ */
+async function handleAdhocPatchScriptModules(
+  script: string,
+  sources: Map<string, string>,
+  installation: Installation,
+  skipConfirmation: boolean,
+  dangerousNoScriptSandbox: boolean
+): Promise<void> {
+  console.log(
+    dangerousNoScriptSandbox
+      ? `Running patch script on ${sources.size} modules WITHOUT sandbox (--dangerous-no-script-sandbox)...`
+      : `Running patch script on ${sources.size} modules in sandbox...`
+  );
+  let result: Awaited<ReturnType<typeof runScriptOnModules>>;
+  try {
+    result = await runScriptOnModules(
+      script,
+      sources,
+      dangerousNoScriptSandbox
     );
-
-    modified =
-      content.slice(0, matchStart) +
-      resolvedReplacement +
-      content.slice(matchEnd);
-    count = 1;
-  } else {
-    // Replace all matches
-    modified = content.replace(regex, replacement);
-    // Count matches
-    count = [...content.matchAll(new RegExp(parsed.pattern, flags))].length;
-
-    if (count === 0) {
-      console.error(chalk.red('Error: Regex pattern not found in content.'));
-      process.exit(1);
-    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.error(chalk.red(`Error: Script execution failed:`));
+    console.error(chalk.red(`  ${message}`));
+    process.exit(1);
   }
 
-  const approved = await promptUserForDiffApproval(
-    content,
-    modified,
+  if (result.error && result.modified.size === 0) {
+    console.error(
+      chalk.red(
+        `Error: Script failed in ${result.failures} of ${sources.size} module(s) and changed none. First error, in ${result.error[0]}:`
+      )
+    );
+    console.error(chalk.red(`  ${result.error[1]}`));
+    process.exit(1);
+  }
+
+  if (result.modified.size === 0) {
+    console.log(
+      chalk.yellow('Script returned unchanged content. Nothing to do.')
+    );
+    return;
+  }
+
+  if (result.error) {
+    console.log(
+      chalk.gray(
+        `${result.failures} module(s) skipped because the script threw (first, in ${result.error[0]}: ${result.error[1]})`
+      )
+    );
+  }
+
+  const approved = await promptUserForModuleDiffApproval(
+    sources,
+    result.modified,
     skipConfirmation
   );
   if (!approved) {
@@ -674,11 +793,11 @@ async function handleAdhocPatchRegex(
     return;
   }
 
-  await writeContent(installation, modified);
+  const changed = await writeModulesOrExit(installation, result.modified);
 
   console.log(
     chalk.green(
-      `✓ Replaced ${count} match(es) in ${chalk.cyan(installation.path)}`
+      `✓ Script patch applied to ${changed.length} module(s) of ${chalk.cyan(installation.path)}`
     )
   );
 }
@@ -692,13 +811,25 @@ async function handleAdhocPatchScriptImpl(
   skipConfirmation = false,
   dangerousNoScriptSandbox = false
 ): Promise<void> {
+  const graph = await readNativeGraph(installation);
+  if (graph) {
+    const script = await resolveScriptSource(scriptArg);
+    console.log('Resolving variables...');
+    await handleAdhocPatchScriptModules(
+      script,
+      javaScriptModuleSources(graph),
+      installation,
+      skipConfirmation,
+      dangerousNoScriptSandbox
+    );
+    return;
+  }
+
   const content = await readContent(installation);
 
   const script = await resolveScriptSource(scriptArg);
 
   console.log('Resolving variables...');
-  const vars = resolveVars(content);
-
   console.log(
     dangerousNoScriptSandbox
       ? 'Running patch script WITHOUT sandbox (--dangerous-no-script-sandbox)...'
@@ -706,25 +837,15 @@ async function handleAdhocPatchScriptImpl(
   );
   let modified: string;
   try {
-    modified = await runSandboxedScript(
+    modified = await runScriptOnContent(
       script,
       content,
-      vars,
       dangerousNoScriptSandbox
     );
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     console.error(chalk.red(`Error: Script execution failed:`));
     console.error(chalk.red(`  ${message}`));
-    process.exit(1);
-  }
-
-  if (typeof modified !== 'string') {
-    console.error(
-      chalk.red(
-        'Error: Script did not return a string. Got: ' + typeof modified
-      )
-    );
     process.exit(1);
   }
 

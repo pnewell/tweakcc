@@ -47,6 +47,7 @@ import {
   askYesNo,
 } from './commands';
 import { getPlannedPatches, printApplyPlan } from './applyPlan';
+import { listCustomPatches } from './patches/customPatches';
 import {
   restoreClijsFromBackup,
   restoreNativeBinaryFromBackup,
@@ -106,6 +107,7 @@ function printPatchResults(
     PatchGroup.ALWAYS_APPLIED,
     PatchGroup.MISC_CONFIGURABLE,
     PatchGroup.FEATURES,
+    PatchGroup.CUSTOM,
   ];
 
   // Group results by PatchGroup
@@ -280,21 +282,27 @@ const main = async () => {
 
   program
     .command('unpack')
-    .argument('<output-js-path>', 'path to write extracted JS')
+    .argument(
+      '<output-path>',
+      'path to write extracted JS (a directory for code-split builds)'
+    )
     .argument('[binary-path]', 'path to native binary (default: auto-detect)')
     .description('Extract JS from a native Claude Code binary')
-    .action(async (outputJsPath: string, binaryPath?: string) => {
-      await handleUnpack(outputJsPath, binaryPath);
+    .action(async (outputPath: string, binaryPath?: string) => {
+      await handleUnpack(outputPath, binaryPath);
       process.exit(0);
     });
 
   program
     .command('repack')
-    .argument('<input-js-path>', 'path to JS file to embed')
+    .argument(
+      '<input-path>',
+      'path to JS file to embed (a directory for code-split builds)'
+    )
     .argument('[binary-path]', 'path to native binary (default: auto-detect)')
     .description('Embed JS into a native Claude Code binary')
-    .action(async (inputJsPath: string, binaryPath?: string) => {
-      await handleRepack(inputJsPath, binaryPath);
+    .action(async (inputPath: string, binaryPath?: string) => {
+      await handleRepack(inputPath, binaryPath);
       process.exit(0);
     });
 
@@ -408,7 +416,12 @@ async function handleApplyMode(
     console.log(`Version: ${ccInstInfo.version}`);
 
     // Pre-apply summary + consent (adhoc-patch already confirms; --apply should too)
-    const planned = getPlannedPatches(config, ccInstInfo.version, patchFilter);
+    const planned = getPlannedPatches(
+      config,
+      ccInstInfo.version,
+      patchFilter,
+      await listCustomPatches(config.settings.patches)
+    );
     printApplyPlan(planned, {
       configSource,
       patchFilter,

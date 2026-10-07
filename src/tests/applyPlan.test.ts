@@ -81,6 +81,25 @@ describe('applyPlan', () => {
     expect(planned.map(p => p.id)).toEqual(['session-memory']);
   });
 
+  it('plans patch scripts in place of the built-in patches they replace', () => {
+    const planned = getPlannedPatches(
+      configWithDefaults(),
+      '2.1.200',
+      null,
+      new Map([
+        ['session-memory', '/patches/session-memory.js'],
+        ['extra', '/patches/extra.js'],
+      ])
+    );
+    expect(planned.filter(p => p.id === 'session-memory')).toEqual([
+      expect.objectContaining({
+        name: 'session-memory.js',
+        description: '/patches/session-memory.js (replaces Session memory)',
+      }),
+    ]);
+    expect(planned.at(-1)?.id).toBe('extra');
+  });
+
   it('skips themes when settings match defaults', () => {
     expect(
       isPatchEnabledByConfig('themes', configWithDefaults(), '2.1.200')

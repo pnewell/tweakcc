@@ -179,6 +179,7 @@ export interface Settings {
   inputPatternHighlighters: InputPatternHighlighter[];
   inputPatternHighlightersTestText: string; // Global test text for previewing highlighters
   claudeMdAltNames: string[] | null;
+  patches: string[];
 }
 
 export interface RemoteConfig {
