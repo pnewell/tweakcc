@@ -31,9 +31,9 @@ import {
   moduleFilePath,
   regexReplacer,
   replaceInSources,
-  runScriptOnModules,
   stringReplacer,
 } from '../commands';
+import { runScriptOnModules } from '../patchScripts';
 
 const sources = (entries: Record<string, string>) =>
   new Map(Object.entries(entries));

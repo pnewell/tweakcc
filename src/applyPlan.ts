@@ -5,6 +5,7 @@
  * so users can see (and approve) what will run before their CC binary is rewritten.
  */
 
+import path from 'node:path';
 import chalk from 'chalk';
 
 import { DEFAULT_SETTINGS } from './defaultSettings';
@@ -17,7 +18,8 @@ import {
 import { TweakccConfig } from './types';
 import { compareVersions } from './systemPromptSync';
 
-export interface PlannedPatch extends PatchDefinition {
+export interface PlannedPatch extends Omit<PatchDefinition, 'id'> {
+  id: string;
   /** Enabled because a DEFAULT_SETTINGS value turns this patch on. */
   defaultOn: boolean;
 }
@@ -203,12 +205,16 @@ export function isPatchEnabledByConfig(
 export function getPlannedPatches(
   config: TweakccConfig,
   version: string | null | undefined,
-  patchFilter?: string[] | null
+  patchFilter?: string[] | null,
+  customPatches: ReadonlyMap<string, string> = new Map()
 ): PlannedPatch[] {
   const planned: PlannedPatch[] = [];
 
   for (const def of getAllPatchDefinitions()) {
     if (patchFilter && !patchFilter.includes(def.id)) {
+      continue;
+    }
+    if (customPatches.has(def.id)) {
       continue;
     }
     if (!isPatchEnabledByConfig(def.id, config, version)) {
@@ -217,6 +223,20 @@ export function getPlannedPatches(
     planned.push({
       ...def,
       defaultOn: DEFAULT_ON_WITHOUT_VERSION_GATE.has(def.id),
+    });
+  }
+
+  for (const [id, source] of customPatches) {
+    if (patchFilter && !patchFilter.includes(id)) {
+      continue;
+    }
+    const replaced = getAllPatchDefinitions().find(def => def.id === id);
+    planned.push({
+      id,
+      name: path.basename(source),
+      group: PatchGroup.CUSTOM,
+      description: replaced ? `${source} (replaces ${replaced.name})` : source,
+      defaultOn: false,
     });
   }
 
@@ -235,6 +255,7 @@ export function printApplyPlan(
     PatchGroup.ALWAYS_APPLIED,
     PatchGroup.MISC_CONFIGURABLE,
     PatchGroup.FEATURES,
+    PatchGroup.CUSTOM,
   ];
 
   console.log(chalk.bold('\nPre-apply summary'));

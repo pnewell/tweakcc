@@ -743,6 +743,7 @@ export const DEFAULT_SETTINGS: Settings = {
     'WARP.md',
     'copilot-instructions.md',
   ],
+  patches: [],
 };
 
 /**

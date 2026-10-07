@@ -47,6 +47,7 @@ import {
   askYesNo,
 } from './commands';
 import { getPlannedPatches, printApplyPlan } from './applyPlan';
+import { listCustomPatches } from './patches/customPatches';
 import {
   restoreClijsFromBackup,
   restoreNativeBinaryFromBackup,
@@ -106,6 +107,7 @@ function printPatchResults(
     PatchGroup.ALWAYS_APPLIED,
     PatchGroup.MISC_CONFIGURABLE,
     PatchGroup.FEATURES,
+    PatchGroup.CUSTOM,
   ];
 
   // Group results by PatchGroup
@@ -414,7 +416,12 @@ async function handleApplyMode(
     console.log(`Version: ${ccInstInfo.version}`);
 
     // Pre-apply summary + consent (adhoc-patch already confirms; --apply should too)
-    const planned = getPlannedPatches(config, ccInstInfo.version, patchFilter);
+    const planned = getPlannedPatches(
+      config,
+      ccInstInfo.version,
+      patchFilter,
+      await listCustomPatches(config.settings.patches)
+    );
     printApplyPlan(planned, {
       configSource,
       patchFilter,

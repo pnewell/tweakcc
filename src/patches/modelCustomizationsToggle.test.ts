@@ -25,6 +25,7 @@ vi.mock('node:fs/promises', () => ({
 vi.mock('../config', () => ({
   CONFIG_DIR: '/tmp/tweakcc-test-config',
   NATIVE_BINARY_BACKUP_FILE: '/tmp/tweakcc-test-config/native.backup',
+  PATCHES_DIR: '/tmp/tweakcc-test-config/patches',
   updateConfigFile: vi.fn(async updateFn => {
     const config = { changesApplied: false } as TweakccConfig;
     updateFn(config);
