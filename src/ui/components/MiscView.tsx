@@ -99,6 +99,7 @@ export function MiscView({ onSubmit }: MiscViewProps) {
     enableChannelsMode: false,
     disableCtrlZSuspend: false,
     skipSkillShellValidation: false,
+    blankSafetyClassifierStopMessage: false,
     preventUpdateToUnsupportedVersions: false,
     webFetchUserAgent: null as string | null,
     shimmer: { ...DEFAULT_SETTINGS.misc.shimmer },

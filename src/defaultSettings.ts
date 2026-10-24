@@ -725,6 +725,7 @@ export const DEFAULT_SETTINGS: Settings = {
     enableChannelsMode: false,
     disableCtrlZSuspend: false,
     skipSkillShellValidation: false,
+    blankSafetyClassifierStopMessage: false,
     preventUpdateToUnsupportedVersions: false,
     webFetchUserAgent: null,
     shimmer: { enabled: true, stepMs: null, width: null },
