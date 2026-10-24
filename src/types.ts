@@ -149,6 +149,7 @@ export interface MiscConfig {
   enableChannelsMode: boolean;
   disableCtrlZSuspend: boolean;
   skipSkillShellValidation: boolean;
+  blankSafetyClassifierStopMessage: boolean;
   preventUpdateToUnsupportedVersions: boolean;
   webFetchUserAgent: string | null;
   shimmer: ShimmerConfig;
